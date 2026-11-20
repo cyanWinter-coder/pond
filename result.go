@@ -84,7 +84,7 @@ func (p *resultPool[R]) submit(task any, nonBlocking bool) (ResultTask[R], bool)
 		return future, false
 	}
 
-	wrapped := wrapTask[R, func(R, error)](task, resolve, ctx, p.pool.panicRecovery)
+	wrapped := wrapTaskWithGate[R, func(R, error)](task, resolve, p.pool.taskCtx, p.pool.panicRecovery)
 
 	if err := p.pool.submit(wrapped, nonBlocking); err != nil {
 		var zero R

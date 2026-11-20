@@ -7,6 +7,7 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/alitto/pond/v2/internal/future"
 	"github.com/alitto/pond/v2/internal/linkedbuffer"
@@ -83,6 +84,19 @@ type BasePool interface {
 	// Stops the pool and waits for all tasks to complete.
 	StopAndWait()
 
+	// Stops the pool immediately and drains the task queue up to the given deadline.
+	// No new tasks are accepted once this method is called. Queued tasks continue
+	// to run in submission order until the deadline; tasks that have not started by
+	// then are not executed and resolve with a context error wrapping
+	// context.DeadlineExceeded (and ErrDrainDeadline). Tasks already running when
+	// the deadline expires are not interrupted and keep their own result.
+	// The returned future resolves once all workers have exited.
+	Drain(deadline time.Time) Task
+
+	// Stops the pool and drains the task queue up to the given deadline, waiting
+	// for all workers to exit. See Drain for the full semantics.
+	DrainAndWait(deadline time.Time)
+
 	// Returns true if the pool has been stopped or its context has been cancelled.
 	Stopped() bool
 
@@ -140,6 +154,8 @@ type pool struct {
 	parent              *pool
 	ctx                 context.Context
 	cancel              context.CancelCauseFunc
+	taskCtx             context.Context
+	taskCancel          context.CancelCauseFunc
 	nonBlocking         bool
 	panicRecovery       bool
 	maxConcurrency      int
@@ -331,8 +347,9 @@ func (p *pool) subpoolWorker(task any) func() (output any, err error) {
 }
 
 func (p *pool) Go(task func()) error {
-	// Wrap the task so it is skipped if the pool context is canceled while it is queued
-	return p.submit(wrapTask[struct{}, func(error)](task, func(error) {}, p.ctx, p.panicRecovery), p.nonBlocking)
+	// Wrap the task so it is skipped if the pool is canceled or a drain
+	// deadline expires while it is still queued.
+	return p.submit(wrapTaskWithGate[struct{}, func(error)](task, func(error) {}, p.taskCtx, p.panicRecovery), p.nonBlocking)
 }
 
 func (p *pool) Submit(task func()) Task {
@@ -372,7 +389,9 @@ func (p *pool) wrapTask(task any) (Task, func() error, func(error)) {
 	ctx := p.Context()
 	future, resolve := future.NewFuture(ctx)
 
-	wrappedTask := wrapTask[struct{}, func(error)](task, resolve, ctx, p.panicRecovery)
+	// The future follows the pool context while the gate (taskCtx) can
+	// additionally be canceled by a deadline-driven drain to skip queued work.
+	wrappedTask := wrapTaskWithGate[struct{}, func(error)](task, resolve, p.taskCtx, p.panicRecovery)
 
 	return future, wrappedTask, resolve
 }
@@ -554,6 +573,37 @@ func (p *pool) StopAndWait() {
 	p.Stop().Wait()
 }
 
+func (p *pool) Drain(deadline time.Time) Task {
+	return Submit(func() {
+		// Stop accepting new tasks immediately.
+		p.mutex.Lock()
+		p.closed.Store(true)
+		p.mutex.Unlock()
+
+		// Once the deadline is reached, any task still queued is canceled
+		// through the task context before its user code runs. Tasks already
+		// running are not interrupted and their futures are not resolved
+		// externally, so they complete exactly once with their own result.
+		timer := time.AfterFunc(time.Until(deadline), func() {
+			p.taskCancel(errors.Join(context.DeadlineExceeded, ErrDrainDeadline))
+		})
+
+		// Wait for all workers to finish: queued tasks are executed in order
+		// until the deadline, after which the remaining ones short-circuit.
+		p.workerWaitGroup.Wait()
+
+		timer.Stop()
+
+		// Cancel the pool context with a pool stopped error to signal that
+		// the pool has been stopped.
+		p.cancel(ErrPoolStopped)
+	})
+}
+
+func (p *pool) DrainAndWait(deadline time.Time) {
+	p.Drain(deadline).Wait()
+}
+
 func (p *pool) NewSubpool(maxConcurrency int, options ...Option) Pool {
 	return newPool(maxConcurrency, p, options...)
 }
@@ -611,6 +661,9 @@ func newPool(maxConcurrency int, parent *pool, options ...Option) *pool {
 	}
 
 	pool.ctx, pool.cancel = context.WithCancelCause(pool.ctx)
+
+	// Task gate: canceled by the pool context or by a deadline-driven drain.
+	pool.taskCtx, pool.taskCancel = context.WithCancelCause(pool.ctx)
 
 	pool.tasks = linkedbuffer.NewLinkedBuffer[any](LinkedBufferInitialSize, LinkedBufferMaxCapacity)
 

@@ -350,6 +350,28 @@ pool.Submit(func() {
 pool.StopAndWait()
 ```
 
+### Draining a pool with a deadline
+
+`Drain` stops accepting new tasks immediately and gives the queued tasks a bounded amount of time to finish. Queued tasks continue to run in submission order until the deadline; any task that has not started by then is skipped and its future resolves with a context error wrapping both `context.DeadlineExceeded` and `pond.ErrDrainDeadline`. Tasks already running when the deadline expires are not interrupted and keep their own result.
+
+``` go
+// Create a pool with limited concurrency
+pool := pond.NewPool(10)
+
+// Submit tasks...
+
+// Stop accepting new tasks and run queued work only until the deadline
+err := pool.Drain(time.Now().Add(5 * time.Second)).Wait()
+```
+
+`DrainAndWait` is the blocking equivalent, mirroring `StopAndWait`:
+
+``` go
+pool.DrainAndWait(time.Now().Add(5 * time.Second))
+```
+
+Canceled (never started) tasks are counted by `CanceledTasks`; they are neither successful nor failed. Subpools and result pools expose the same methods.
+
 ### Recovering from panics
 
 By default, panics that occur during the execution of a task are captured and returned as errors. This allows you to recover from panics and handle them gracefully.
